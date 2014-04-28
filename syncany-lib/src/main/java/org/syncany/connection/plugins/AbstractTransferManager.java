@@ -19,6 +19,16 @@ package org.syncany.connection.plugins;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+import org.apache.commons.io.FileUtils;
+import org.simpleframework.xml.Serializer;
+import org.simpleframework.xml.core.Persister;
+import org.syncany.config.Config;
 
 /**
  * Implements basic functionality of a {@link TransferManager} which
@@ -27,8 +37,9 @@ import java.io.IOException;
  * @author Philipp C. Heckel <philipp.heckel@gmail.com>
  */
 public abstract class AbstractTransferManager implements TransferManager {
+	private static final Logger logger = Logger.getLogger(AbstractTransferManager.class.getSimpleName());	
 	private Connection connection;
-
+	
 	public AbstractTransferManager(Connection connection) {
 		this.connection = connection;
 	}
@@ -43,31 +54,36 @@ public abstract class AbstractTransferManager implements TransferManager {
 	}
 
 	@Override
-	public StorageTestResult test() {
-		StorageTestResult result = null;
+	public StorageTestResult test(boolean testCreateTarget) {
+		logger.log(Level.INFO, "Performing storage test TM.test() ...");							
+		StorageTestResult result = new StorageTestResult();
 		
 		try {
 			connect();
 	
-			if (repoExists()) {
-				if (repoIsValid()) {
-					result = StorageTestResult.REPO_EXISTS_BUT_INVALID;
-				}
-				else {
-					result = StorageTestResult.REPO_EXISTS;
-				}
+			result.setTargetExists(testTargetExists());
+			result.setTargetCanWrite(testTargetCanWrite());
+			result.setRepoFileExists(testRepoFileExists());
+
+			if (result.isTargetExists()) {
+				result.setTargetCanCreate(true);
 			}
 			else {
-				if (repoHasWriteAccess()) {
-					result = StorageTestResult.NO_REPO;
+				if (testCreateTarget) {
+					result.setTargetCanCreate(testTargetCanCreate());
 				}
 				else {
-					result = StorageTestResult.NO_REPO_CANNOT_CREATE;
+					result.setTargetCanCreate(false);
 				}
-			}	
+			}
+			
+			result.setTargetCanConnect(true);
 		}
 		catch (StorageException e) {
-			result = StorageTestResult.NO_CONNECTION;
+			result.setTargetCanConnect(false);
+			result.setException(e);
+			
+			logger.log(Level.INFO, "-> Testing storage failed. Returning " + result, e);
 		}
 		finally {
 			try {
@@ -79,5 +95,55 @@ public abstract class AbstractTransferManager implements TransferManager {
 		}
 		
 		return result;
+	}
+	
+	/**
+	 * Returns a Set of all files that are not temporary, but are listed in a 
+	 * transaction file. These belong to an unfinished transaction and should be
+	 * ignored.
+	 */
+	protected Set<RemoteFile> getFilesInTransactions() throws StorageException {
+		Set<RemoteFile> filesInTransaction = new HashSet<RemoteFile>();
+		Map<String, TransactionRemoteFile> transactionFiles = list(TransactionRemoteFile.class);
+		for (TransactionRemoteFile transaction : transactionFiles.values()) {
+			Map<RemoteFile, RemoteFile> finalLocations = null;
+			String machineName = null;
+			try {
+				File transactionFile = File.createTempFile("transaction-", "", connection.getConfig().getCacheDir());
+				// Download transaction file
+				download(transaction, transactionFile);
+				String transactionFileStr = FileUtils.readFileToString(transactionFile);
+				// Deserialize it
+				Serializer serializer = new Persister();
+				TransactionTO transactionTO = serializer.read(TransactionTO.class, transactionFileStr);
+				// Extract final locations
+				finalLocations = transactionTO.getFinalLocations();
+				machineName = transactionTO.getMachineName();
+				transactionFile.delete();
+			}
+			catch (Exception e) {
+				e.printStackTrace();
+				throw new StorageException("Failed to read transactionFile", e);
+			}
+			boolean cleaned = false;
+			if (connection.getConfig().getMachineName().equals(machineName)) {
+				cleaned = cleanup(transaction, finalLocations);
+			}
+			if (finalLocations != null && !cleaned) {
+				filesInTransaction.addAll(finalLocations.values());
+			}
+		}
+		
+		return filesInTransaction;
+	}
+	/**
+	 * This method removes all files related to an unfinished transaction.
+	 */
+	protected boolean cleanup(TransactionRemoteFile transaction, Map<RemoteFile, RemoteFile> finalLocations) throws StorageException {
+		for (RemoteFile temporaryLocation : finalLocations.keySet()) {
+			delete(temporaryLocation);
+			delete(finalLocations.get(temporaryLocation));
+		}
+		return delete(transaction);
 	}
 }

@@ -20,12 +20,13 @@ package org.syncany.connection.plugins.local;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
-import java.io.FilenameFilter;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -36,6 +37,8 @@ import org.syncany.connection.plugins.MultiChunkRemoteFile;
 import org.syncany.connection.plugins.RemoteFile;
 import org.syncany.connection.plugins.RepoRemoteFile;
 import org.syncany.connection.plugins.StorageException;
+import org.syncany.connection.plugins.TempRemoteFile;
+import org.syncany.connection.plugins.TransactionRemoteFile;
 import org.syncany.connection.plugins.TransferManager;
 
 /**
@@ -64,6 +67,7 @@ public class LocalTransferManager extends AbstractTransferManager {
 	private File repoPath;
 	private File multichunksPath;
 	private File databasePath;
+	private File transactionPath;
 
 	public LocalTransferManager(LocalConnection connection) {
 		super(connection);
@@ -71,6 +75,7 @@ public class LocalTransferManager extends AbstractTransferManager {
 		this.repoPath = connection.getRepositoryPath().getAbsoluteFile(); // absolute file to get abs. path!
 		this.multichunksPath = new File(connection.getRepositoryPath().getAbsolutePath(), "multichunks");
 		this.databasePath = new File(connection.getRepositoryPath().getAbsolutePath(), "databases");
+		this.transactionPath = new File(connection.getRepositoryPath().getAbsolutePath(), "transaction");
 	}
 
 	@Override
@@ -89,7 +94,7 @@ public class LocalTransferManager extends AbstractTransferManager {
 	public void init(boolean createIfRequired) throws StorageException {
 		connect();
 
-		if (!repoExists() && createIfRequired) {
+		if (!testTargetExists() && createIfRequired) {
 			if (!repoPath.mkdir()) {
 				throw new StorageException("Cannot create repository directory: " + repoPath);
 			}
@@ -101,6 +106,10 @@ public class LocalTransferManager extends AbstractTransferManager {
 
 		if (!databasePath.mkdir()) {
 			throw new StorageException("Cannot create database directory: " + databasePath);
+		}
+		
+		if (!transactionPath.mkdir()) {
+			throw new StorageException("Cannot create transaction directory: " + transactionPath);
 		}
 	}
 
@@ -154,6 +163,21 @@ public class LocalTransferManager extends AbstractTransferManager {
 			throw new StorageException("Unable to copy file " + localFile + " to local repository " + repoFile, ex);
 		}
 	}
+	
+	@Override
+	public void move(RemoteFile sourceFile, RemoteFile targetFile) throws StorageException {
+		connect();
+
+		File source = getRemoteFile(sourceFile);
+		File target = getRemoteFile(targetFile);
+
+		try {
+			FileUtils.moveFile(source, target);
+		}
+		catch (IOException ex) {
+			throw new StorageException("Unable to move file " + source + " to destination " + target, ex);
+		}
+	}
 
 	@Override
 	public boolean delete(RemoteFile remoteFile) throws StorageException {
@@ -171,6 +195,15 @@ public class LocalTransferManager extends AbstractTransferManager {
 	@Override
 	public <T extends RemoteFile> Map<String, T> list(Class<T> remoteFileClass) throws StorageException {
 		connect();
+		
+		Set<RemoteFile> filesToIgnore;
+		if (remoteFileClass.equals(TransactionRemoteFile.class)) {
+			// If we are listing transaction files, we don't want to ignore any
+			filesToIgnore = new HashSet<RemoteFile>();
+		}
+		else {
+			filesToIgnore = getFilesInTransactions();
+		}
 
 		// List folder
 		File remoteFilePath = getRemoteFilePath(remoteFileClass);
@@ -180,13 +213,17 @@ public class LocalTransferManager extends AbstractTransferManager {
 			throw new StorageException("Unable to read local respository " + repoPath);
 		}
 
+		
+		
 		// Create RemoteFile objects
 		Map<String, T> remoteFiles = new HashMap<String, T>();
 
 		for (File file : files) {
 			try {
 				T remoteFile = RemoteFile.createRemoteFile(file.getName(), remoteFileClass);
-				remoteFiles.put(file.getName(), remoteFile);
+				if (!filesToIgnore.contains(remoteFile)) {
+					remoteFiles.put(file.getName(), remoteFile);
+				}
 			}
 			catch (Exception e) {
 				logger.log(Level.INFO, "Cannot create instance of " + remoteFileClass.getSimpleName() + " for file " + file
@@ -207,6 +244,9 @@ public class LocalTransferManager extends AbstractTransferManager {
 		}
 		else if (remoteFile.equals(DatabaseRemoteFile.class)) {
 			return databasePath;
+		}
+		else if (remoteFile.equals(TempRemoteFile.class) || remoteFile.equals(TransactionRemoteFile.class)) {
+			return transactionPath;
 		}
 		else {
 			return repoPath;
@@ -233,26 +273,67 @@ public class LocalTransferManager extends AbstractTransferManager {
 	}
 
 	@Override
-	public boolean repoHasWriteAccess() {		
-		return repoPath.getParentFile().canWrite();
-	}
+	public boolean testTargetCanWrite() {
+		try {
+			if (repoPath.isDirectory()) {
+				File tempFile = File.createTempFile("syncany-write-test", "tmp", repoPath);
+				tempFile.delete();
 
-	@Override
-	public boolean repoExists() throws StorageException {
-		return repoPath.exists();
-	}
-
-	@Override
-	public boolean repoIsValid() throws StorageException {
-		final RepoRemoteFile repoRemoteFile = new RepoRemoteFile();
-		
-		String[] listRepoFile = repoPath.list(new FilenameFilter() {			
-			@Override
-			public boolean accept(File dir, String name) {
-				return name.equals(repoRemoteFile.getName());
+				logger.log(Level.INFO, "testTargetCanWrite: Can write, test file created/deleted successfully.");
+				return true;
 			}
-		});
-				
-		return (listRepoFile != null) ? listRepoFile.length == 0 : true;
+			else {
+				logger.log(Level.INFO, "testTargetCanWrite: Can NOT write, target does not exist.");
+				return false;
+			}
+		}
+		catch (Exception e) {
+			logger.log(Level.INFO, "testTargetCanWrite: Can NOT write to target.", e);
+			return false;
+		}
+	}
+
+	@Override
+	public boolean testTargetExists() {
+		if (repoPath.exists()) {
+			logger.log(Level.INFO, "testTargetExists: Target exists.");
+			return true;
+		}
+		else {
+			logger.log(Level.INFO, "testTargetExists: Target does NOT exist.");
+			return false;
+		}
+	}
+
+	@Override
+	public boolean testRepoFileExists() {
+		try {
+			File repoFile = getRemoteFile(new RepoRemoteFile());
+			
+			if (repoFile.exists()) {
+				logger.log(Level.INFO, "testRepoFileExists: Repo file exists, list(syncany) returned one result.");
+				return true;
+			}
+			else {
+				logger.log(Level.INFO, "testRepoFileExists: Repo file DOES NOT exist.");
+				return false;
+			}
+		}
+		catch (Exception e) {
+			logger.log(Level.INFO, "testRepoFileExists: Repo file DOES NOT exist. Exception occurred.", e);
+			return false;			
+		}
+	}
+
+	@Override
+	public boolean testTargetCanCreate() {
+		if (repoPath.getParentFile().canWrite()) {
+			logger.log(Level.INFO, "testTargetCanCreate: Can create target.");
+			return true;
+		}
+		else {
+			logger.log(Level.INFO, "testTargetCanCreate: Can NOT create target.");
+			return false;
+		}
 	}
 }
